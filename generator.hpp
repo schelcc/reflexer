@@ -1,0 +1,356 @@
+#pragma once
+
+#include <array>
+#include <cassert>
+#include <cstddef>
+#include <deque>
+#include <queue>
+#include <set>
+#include <tuple>
+#include <unordered_map>
+#include <utility>
+
+#include "rules.hpp"
+
+namespace Reflexer::Generator {
+
+/// @brief Maps char value to next state, or -1 if no state can follow
+using TransitionMap = std::array<int, 128>;
+
+/// @brief Maps positions in the tree to positions which can follow
+using PositionSet = std::vector<std::set<size_t>>;
+
+/// @brief Maps position index to the character in the regex it represents
+using PositionMap = std::vector<char>;
+
+/// @brief Character used in the augmented regexes to represent the
+/// end of an individual token
+static constexpr char END_CHAR = char{0};
+
+/// @brief Character used to represent the '.' "any" character
+static constexpr char ANY_CHAR = char{26};
+
+/** @brief Represents a state in the DFA as a set of positions. Currently hashes
+ * by concatenating positions as strings, delimited by ":", and calculating the
+ * string's hash.
+ *
+ * Later improvement by selecting a different hashing approach would eliminate
+ * need for both string and an ordered set. */
+struct DFAState {
+  std::set<size_t> positions{};
+
+  [[nodiscard]] bool operator==(DFAState const &other) const noexcept {
+    return positions == other.positions;
+  }
+
+  operator std::string() const {
+    std::string out = "";
+    if (positions.empty())
+      return out;
+
+    for (size_t pos : positions)
+      out += std::to_string(pos) + ":";
+
+    out.pop_back();
+    return out;
+  }
+};
+
+struct DFA {
+  std::vector<TransitionMap> transitions;
+  std::vector<size_t> accepting_states;
+};
+
+}; // namespace Reflexer::Generator
+
+namespace std {
+template <> struct hash<Reflexer::Generator::DFAState> {
+  inline size_t operator()(Reflexer::Generator::DFAState const &s) const {
+    return hash<string>{}(s);
+  }
+};
+}; // namespace std
+
+namespace Reflexer::Generator {
+
+struct ParsingContext {
+  std::vector<Rules::Rule> rules{};
+  PositionSet pos_set{};
+  PositionMap pos_map{};
+  int pos_cnt = 0;
+};
+
+static inline DFA BuildDFA(Rules::Rule const &root_rule,
+                           PositionSet const &followpos,
+                           PositionMap const &pos_map) {
+  std::vector<TransitionMap> transitions{};
+  std::vector<size_t> accepting_states{};
+
+  // The amount of information in DFAState objects is not necessary after
+  // construction, so maintain a temporary mapping of DFAStates to transition
+  // indices
+  std::unordered_map<DFAState, size_t> state_map{};
+
+  std::queue<DFAState> to_visit{};
+
+  to_visit.emplace(*root_rule.firstpos);
+  state_map.emplace(*root_rule.firstpos, 0);
+
+  // Back of transitions should always be the "current" state
+  transitions.emplace_back();
+  transitions.back().fill(-1);
+
+  while (!to_visit.empty()) {
+    DFAState state = to_visit.back();
+    to_visit.pop();
+
+    size_t state_idx = state_map.at(state);
+
+    std::unordered_map<char, std::set<size_t>> char_to_pos_set{};
+
+    // Group all positions in this state by their corresponding character
+    for (size_t pos : state.positions) {
+      char c = pos_map.at(pos);
+      char_to_pos_set.try_emplace(pos_map.at(pos));
+      char_to_pos_set.at(c).emplace(pos);
+    }
+
+    if (char_to_pos_set.contains(END_CHAR)) {
+      // If the state contains the end char, mark it as an accepting state and
+      // remove the end char to prevent a transition on it
+      accepting_states.emplace_back(state_idx);
+      char_to_pos_set.erase(END_CHAR);
+    }
+
+    for (auto [c, positions] : char_to_pos_set) {
+      DFAState new_state{};
+
+      for (size_t pos : positions)
+        new_state.positions.insert_range(followpos.at(pos));
+
+      auto [iter, is_new_state] =
+          state_map.try_emplace(new_state, transitions.size());
+
+      if (is_new_state) {
+        transitions.emplace_back();
+        transitions.back().fill(-1);
+        to_visit.emplace(std::move(new_state));
+      }
+
+      transitions.at(state_idx).at(c) = iter->second;
+      if (c == ANY_CHAR) {
+        auto &trans = transitions.at(state_idx);
+        auto next = iter->second;
+
+        for (char i = 32; i < 127; ++i)
+          trans[i] = next;
+
+        // Undo adding a transition on the ANY_CHAR
+        trans[ANY_CHAR] = -1;
+      }
+    }
+  }
+
+  return {std::move(transitions), std::move(accepting_states)};
+}
+
+static inline Rules::Rule &SolveTree(std::vector<Rules::Rule> &rules,
+                                     PositionSet &followpos,
+                                     size_t const root_ptr) {
+  struct Vis {
+    Rules::Rule &enclosing_rule;
+
+    std::vector<Rules::Rule> &rules;
+    PositionSet &followpos;
+
+    void operator()(Rules::Union &r) {
+      assert(r.left_child.has_value() && r.right_child.has_value());
+
+      Rules::Rule &left = SolveTree(rules, followpos, *r.left_child);
+      Rules::Rule &right = SolveTree(rules, followpos, *r.right_child);
+
+      assert(!left.firstpos->empty());
+      assert(!left.lastpos->empty());
+
+      assert(!right.firstpos->empty());
+      assert(!right.lastpos->empty());
+
+      enclosing_rule.nullable = *left.nullable || *right.nullable;
+
+      enclosing_rule.firstpos = *left.firstpos;
+      enclosing_rule.firstpos->insert_range(*right.firstpos);
+
+      enclosing_rule.lastpos = *left.lastpos;
+      enclosing_rule.lastpos->insert_range(*right.lastpos);
+    }
+    void operator()(Rules::Concat &r) {
+
+      assert(r.left_child.has_value() && r.right_child.has_value());
+
+      Rules::Rule &left = SolveTree(rules, followpos, *r.left_child);
+      Rules::Rule &right = SolveTree(rules, followpos, *r.right_child);
+
+      assert(!left.firstpos->empty());
+      assert(!left.lastpos->empty());
+
+      assert(!right.firstpos->empty());
+      assert(!right.lastpos->empty());
+
+      enclosing_rule.nullable = *left.nullable && *right.nullable;
+
+      enclosing_rule.firstpos = *left.firstpos;
+      if (*left.nullable)
+        enclosing_rule.firstpos->insert_range(*right.firstpos);
+
+      enclosing_rule.lastpos = *right.lastpos;
+      if (*right.nullable)
+        enclosing_rule.lastpos->insert_range(*right.lastpos);
+
+      for (size_t i : *left.lastpos)
+        followpos.at(i).insert_range(*right.firstpos);
+    }
+    void operator()(Rules::Repeat &r) {
+      // For now, only going to handle kleene (min 0, max null)
+      assert(r.child.has_value() && !r.max_repeat.has_value());
+
+      Rules::Rule &child = SolveTree(rules, followpos, *r.child);
+
+      assert(!child.firstpos->empty());
+      assert(!child.lastpos->empty());
+
+      enclosing_rule.nullable = (r.min_repeat == 0);
+      enclosing_rule.firstpos = *child.firstpos;
+      enclosing_rule.lastpos = *child.lastpos;
+
+      for (size_t i : *child.lastpos)
+        followpos.at(i).insert_range(*enclosing_rule.firstpos);
+    }
+    void operator()(Rules::Char &r) {
+      enclosing_rule.nullable = false;
+      enclosing_rule.firstpos = {r.pos};
+      enclosing_rule.lastpos = {r.pos};
+    }
+    void operator()(Rules::Any &r) {
+      enclosing_rule.nullable = false;
+      enclosing_rule.firstpos = {r.pos};
+      enclosing_rule.lastpos = {r.pos};
+    }
+    void operator()(Rules::EndMarker &r) {
+      enclosing_rule.nullable = false;
+      enclosing_rule.firstpos = {r.pos};
+      enclosing_rule.lastpos = {r.pos};
+    }
+  };
+
+  Rules::Rule &rule = rules.at(root_ptr);
+  std::visit(Vis{rule, rules, followpos}, rule);
+  return rule;
+}
+
+static inline size_t ParseSubExpr(ParsingContext &ctx,
+                                  std::string_view::const_iterator &s_it,
+                                  std::string_view::const_iterator const &s_end,
+                                  int group_depth = 0) {
+  std::deque<size_t> complete{};
+
+  // Procedure to bottom-to-top concatenate rules, leaving just one rule on the
+  // complete stack
+  auto summarize_complete = [&] {
+    while (complete.size() > 1) {
+      size_t left_expr = complete.front();
+      complete.pop_front();
+
+      size_t right_expr = complete.front();
+      complete.pop_front();
+
+      ctx.rules.emplace_back(std::in_place_type_t<Rules::Concat>(), left_expr,
+                             right_expr);
+      complete.emplace_front(ctx.rules.size() - 1);
+    }
+  };
+  while (s_it < s_end) {
+    switch (*s_it) {
+    case '(':
+      complete.emplace_back(ParseSubExpr(ctx, ++s_it, s_end, group_depth + 1));
+      break;
+    case ')': {
+      if (group_depth == 0)
+        throw std::invalid_argument(
+            "Closing parenthesis without corresponding open parenthesis");
+      summarize_complete();
+      return complete.back();
+    } break;
+    case '|': {
+      if (complete.empty() || (++s_it >= s_end))
+        throw std::invalid_argument("Regex-or operator missing an operand");
+
+      summarize_complete();
+
+      size_t left_expr = complete.back();
+      complete.pop_back();
+
+      ctx.rules.emplace_back(std::in_place_type_t<Rules::Union>(), left_expr,
+                             ParseSubExpr(ctx, s_it, s_end, group_depth));
+      return ctx.rules.size() - 1;
+    } break;
+    case '*': {
+      if (complete.empty())
+        throw std::invalid_argument(
+            "Regex zero-or-more operator missing operand");
+
+      ctx.rules.emplace_back(std::in_place_type_t<Rules::Repeat>(),
+                             complete.back());
+      complete.pop_back();
+      complete.emplace_back(ctx.rules.size() - 1);
+    } break;
+    case '.': {
+      ctx.pos_map.emplace_back(ANY_CHAR);
+      ctx.rules.emplace_back(std::in_place_type_t<Rules::Any>(), ctx.pos_cnt++);
+      complete.emplace_back(ctx.rules.size() - 1);
+    } break;
+    case END_CHAR: {
+      // Patterns joined as augmented regexes w/ ((r1)\0)|((r2)\0)|...|((rn)\0)
+      // We handle this, not the user, so protect these w/ asserts not errs.
+      assert((((s_it + 1) < s_end),
+              "final end marker must be followed by a closing parenthesis"));
+      assert(((*(s_it + 1) == ')'),
+              "end marker must be followed by a closing parenthesis"));
+      assert(((((s_it + 2) < s_end) ? (*(s_it + 2) == '|') : true),
+              "non-final augmented pattern must be followed by a union"));
+
+      ctx.pos_map.emplace_back(END_CHAR);
+      ctx.rules.emplace_back(std::in_place_type_t<Rules::EndMarker>(),
+                             ctx.pos_cnt++);
+      complete.emplace_back(ctx.rules.size() - 1);
+    } break;
+    default: {
+      ctx.pos_map.emplace_back(*s_it);
+      ctx.rules.emplace_back(std::in_place_type_t<Rules::Char>(), *s_it,
+                             ctx.pos_cnt++);
+      complete.emplace_back(ctx.rules.size() - 1);
+    } break;
+      // TODO: '+', '?', '[...]', '[^...]', escaped chars
+    }
+    s_it++;
+  }
+
+  if (complete.empty())
+    throw std::invalid_argument("Empty expression");
+
+  summarize_complete();
+  return complete.back();
+}
+
+static inline std::pair<size_t, ParsingContext>
+ParseExpr(std::string_view const s) {
+  ParsingContext ctx{};
+  auto s_it = s.cbegin();
+
+  size_t root_rule = ParseSubExpr(ctx, s_it, s.cend());
+
+  ctx.pos_set = PositionSet(ctx.pos_cnt);
+
+  return {root_rule, std::move(ctx)};
+}
+
+}; // namespace Reflexer::Generator
