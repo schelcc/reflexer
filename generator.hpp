@@ -58,7 +58,7 @@ struct DFAState {
 
 struct DFA {
   std::vector<TransitionMap> transitions;
-  std::vector<size_t> accepting_states;
+  std::unordered_map<size_t, size_t> accepting_states; // state -> pattern num
 };
 
 }; // namespace Reflexer::Generator
@@ -75,16 +75,14 @@ namespace Reflexer::Generator {
 
 struct ParsingContext {
   std::vector<Rules::Rule> rules{};
-  PositionSet pos_set{};
-  PositionMap pos_map{};
+  std::vector<std::set<size_t>> pos_set{};
+  std::vector<char> pos_map{};
+  std::unordered_map<size_t, size_t> end_marker_map{}; // pos. -> pattern num
   int pos_cnt = 0;
 };
 
-static inline DFA BuildDFA(Rules::Rule const &root_rule,
-                           PositionSet const &followpos,
-                           PositionMap const &pos_map) {
-  std::vector<TransitionMap> transitions{};
-  std::vector<size_t> accepting_states{};
+static inline DFA BuildDFA(ParsingContext const &ctx, size_t const root_ptr) {
+  DFA dfa{};
 
   // The amount of information in DFAState objects is not necessary after
   // construction, so maintain a temporary mapping of DFAStates to transition
@@ -93,15 +91,16 @@ static inline DFA BuildDFA(Rules::Rule const &root_rule,
 
   std::queue<DFAState> to_visit{};
 
+  auto &root_rule = ctx.rules.at(root_ptr);
   to_visit.emplace(*root_rule.firstpos);
   state_map.emplace(*root_rule.firstpos, 0);
 
-  // Back of transitions should always be the "current" state
-  transitions.emplace_back();
-  transitions.back().fill(-1);
+  // Back of dfa.transitions should always be the "current" state
+  dfa.transitions.emplace_back();
+  dfa.transitions.back().fill(-1);
 
   while (!to_visit.empty()) {
-    DFAState state = to_visit.back();
+    DFAState state = to_visit.front();
     to_visit.pop();
 
     size_t state_idx = state_map.at(state);
@@ -110,15 +109,18 @@ static inline DFA BuildDFA(Rules::Rule const &root_rule,
 
     // Group all positions in this state by their corresponding character
     for (size_t pos : state.positions) {
-      char c = pos_map.at(pos);
-      char_to_pos_set.try_emplace(pos_map.at(pos));
+      char c = ctx.pos_map.at(pos);
+      char_to_pos_set.try_emplace(ctx.pos_map.at(pos));
       char_to_pos_set.at(c).emplace(pos);
     }
 
-    if (char_to_pos_set.contains(END_CHAR)) {
-      // If the state contains the end char, mark it as an accepting state and
-      // remove the end char to prevent a transition on it
-      accepting_states.emplace_back(state_idx);
+    auto endmark_it = char_to_pos_set.find(END_CHAR);
+    if (endmark_it != char_to_pos_set.end()) {
+      // Intuitively this should hold but I don't yet know why. But I
+      // rely on it for the next step so protect it.
+      assert(endmark_it->second.size() == 1);
+      dfa.accepting_states.emplace(
+          state_idx, ctx.end_marker_map.at(*endmark_it->second.begin()));
       char_to_pos_set.erase(END_CHAR);
     }
 
@@ -126,20 +128,20 @@ static inline DFA BuildDFA(Rules::Rule const &root_rule,
       DFAState new_state{};
 
       for (size_t pos : positions)
-        new_state.positions.insert_range(followpos.at(pos));
+        new_state.positions.insert_range(ctx.pos_set.at(pos));
 
       auto [iter, is_new_state] =
-          state_map.try_emplace(new_state, transitions.size());
+          state_map.try_emplace(new_state, dfa.transitions.size());
 
       if (is_new_state) {
-        transitions.emplace_back();
-        transitions.back().fill(-1);
+        dfa.transitions.emplace_back();
+        dfa.transitions.back().fill(-1);
         to_visit.emplace(std::move(new_state));
       }
 
-      transitions.at(state_idx).at(c) = iter->second;
+      dfa.transitions.at(state_idx).at(c) = iter->second;
       if (c == ANY_CHAR) {
-        auto &trans = transitions.at(state_idx);
+        auto &trans = dfa.transitions.at(state_idx);
         auto next = iter->second;
 
         for (char i = 32; i < 127; ++i)
@@ -151,7 +153,7 @@ static inline DFA BuildDFA(Rules::Rule const &root_rule,
     }
   }
 
-  return {std::move(transitions), std::move(accepting_states)};
+  return dfa;
 }
 
 static inline Rules::Rule &SolveTree(std::vector<Rules::Rule> &rules,
@@ -319,6 +321,8 @@ static inline size_t ParseSubExpr(ParsingContext &ctx,
               "non-final augmented pattern must be followed by a union"));
 
       ctx.pos_map.emplace_back(END_CHAR);
+      ctx.end_marker_map.emplace(ctx.pos_cnt, ctx.end_marker_map.size());
+
       ctx.rules.emplace_back(std::in_place_type_t<Rules::EndMarker>(),
                              ctx.pos_cnt++);
       complete.emplace_back(ctx.rules.size() - 1);
