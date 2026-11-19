@@ -417,9 +417,9 @@ static inline size_t ParseSubExpr(ParsingContext &ctx,
       }
     } else {
       switch (cur_char) {
-      case '(':
+      case '(': {
         complete.emplace_back(ParseSubExpr(ctx, s_it, s_end, group_depth + 1));
-        break;
+      } break;
       case ')': {
         if (group_depth == 0)
           throw std::invalid_argument(
