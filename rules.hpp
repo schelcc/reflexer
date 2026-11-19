@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
 #include <list>
 #include <meta>
 #include <optional>
@@ -14,12 +16,12 @@ struct Char {
 };
 
 struct Union {
-  std::optional<size_t> left_child;
-  std::optional<size_t> right_child;
+  std::vector<size_t> children{};
 
   Union() = default;
-  Union(size_t l) : left_child(l), right_child(std::nullopt) {}
-  Union(size_t l, size_t r) : left_child(l), right_child(r) {}
+
+  Union(size_t l) : children({l}) {}
+  Union(size_t l, size_t r) : children({l, r}) {}
 };
 
 struct Concat {
@@ -101,6 +103,12 @@ std::string SexpRepr(std::vector<Rule> const &rules, size_t const rule_ptr,
           else
             child_members.append(std::format("\n {}({}: ())", prefix,
                                              std::meta::identifier_of(m)));
+        } else if constexpr (std::meta::display_string_of(m).ends_with(
+                                 "children")) {
+          for (size_t child_idx : r.[:m:])
+            child_members.append(std::format(
+                "\n {}({}: {})", prefix, std::meta::identifier_of(m),
+                SexpRepr(rules, child_idx, prefix + "  ")));
         } else {
           data_members.append(std::meta::identifier_of(m));
           if constexpr (std::meta::has_template_arguments(mt_refl) &&

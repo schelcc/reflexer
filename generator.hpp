@@ -166,24 +166,17 @@ static inline Rules::Rule &SolveTree(std::vector<Rules::Rule> &rules,
     PositionSet &followpos;
 
     void operator()(Rules::Union &r) {
-      assert(r.left_child.has_value() && r.right_child.has_value());
+      enclosing_rule.nullable = false;
+      enclosing_rule.firstpos.emplace();
+      enclosing_rule.lastpos.emplace();
 
-      Rules::Rule &left = SolveTree(rules, followpos, *r.left_child);
-      Rules::Rule &right = SolveTree(rules, followpos, *r.right_child);
-
-      assert(!left.firstpos->empty());
-      assert(!left.lastpos->empty());
-
-      assert(!right.firstpos->empty());
-      assert(!right.lastpos->empty());
-
-      enclosing_rule.nullable = *left.nullable || *right.nullable;
-
-      enclosing_rule.firstpos = *left.firstpos;
-      enclosing_rule.firstpos->insert_range(*right.firstpos);
-
-      enclosing_rule.lastpos = *left.lastpos;
-      enclosing_rule.lastpos->insert_range(*right.lastpos);
+      for (size_t child_idx : r.children) {
+        Rules::Rule child_rule = SolveTree(rules, followpos, child_idx);
+        enclosing_rule.nullable =
+            *enclosing_rule.nullable || *child_rule.nullable;
+        enclosing_rule.firstpos->insert_range(*child_rule.firstpos);
+        enclosing_rule.lastpos->insert_range(*child_rule.lastpos);
+      }
     }
     void operator()(Rules::Concat &r) {
 
