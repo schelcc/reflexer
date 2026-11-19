@@ -34,6 +34,9 @@ static constexpr char END_CHAR = char{0};
 /// @brief Character used to represent the '.' "any" character
 static constexpr char ANY_CHAR = char{26};
 
+/// @brief Character used to denote the empty string
+static constexpr char EMPTY_CHAR = char{21};
+
 namespace PresetCharClass {
 
 consteval std::bitset<128> AlphaLower() {
@@ -275,6 +278,11 @@ static inline Rules::Rule &SolveTree(std::vector<Rules::Rule> &rules,
       enclosing_rule.firstpos = {r.pos};
       enclosing_rule.lastpos = {r.pos};
     }
+    void operator()(Rules::EmptyPos &r) {
+      enclosing_rule.nullable = true;
+      enclosing_rule.firstpos.emplace();
+      enclosing_rule.lastpos.emplace();
+    }
     void operator()(Rules::EndMarker &r) {
       enclosing_rule.nullable = false;
       enclosing_rule.firstpos = {r.pos};
@@ -443,6 +451,7 @@ static inline size_t ParseSubExpr(ParsingContext &ctx,
         complete.emplace_back(ctx.rules.size() - 1);
       } break;
       case '+': {
+        // Concatenation of "<pattern>" and "<pattern>*"
         if (complete.empty())
           throw std::invalid_argument(
               "Regex zero-or-more operator missing operand");
@@ -452,6 +461,22 @@ static inline size_t ParseSubExpr(ParsingContext &ctx,
         ctx.rules.emplace_back(std::in_place_type_t<Rules::Concat>(),
                                complete.back(), ctx.rules.size() - 1);
         complete.pop_back();
+        complete.emplace_back(ctx.rules.size() - 1);
+      } break;
+      case '?': {
+        // Union of "<pattern>" and ""
+        if (complete.empty())
+          throw std::invalid_argument(
+              "Regex zero-or-more operator missing operand");
+
+        size_t nullable_pat = complete.back();
+        complete.pop_back();
+
+        ctx.pos_map.emplace_back(EMPTY_CHAR);
+        ctx.rules.emplace_back(std::in_place_type_t<Rules::EmptyPos>(),
+                               ctx.pos_cnt++);
+        ctx.rules.emplace_back(std::in_place_type_t<Rules::Union>(),
+                               ctx.rules.size() - 1, nullable_pat);
         complete.emplace_back(ctx.rules.size() - 1);
       } break;
       case '.': {

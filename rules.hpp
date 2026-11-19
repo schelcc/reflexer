@@ -51,11 +51,16 @@ struct Any {
   size_t pos;
 };
 
+struct EmptyPos {
+  size_t pos;
+};
+
 struct EndMarker {
   size_t pos;
 };
 
-using RuleTypes = std::variant<Char, Union, Concat, Repeat, Any, EndMarker>;
+using RuleTypes =
+    std::variant<Char, Union, Concat, Repeat, Any, EmptyPos, EndMarker>;
 
 struct Rule : RuleTypes {
   using RuleTypes::variant;
