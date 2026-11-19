@@ -34,13 +34,45 @@ static constexpr char END_CHAR = char{0};
 /// @brief Character used to represent the '.' "any" character
 static constexpr char ANY_CHAR = char{26};
 
-consteval std::bitset<128> ContCharMask() {
-  std::bitset<128> out{0xFFFFFFFF};
-  out.flip();
+namespace PresetCharClass {
+
+consteval std::bitset<128> AlphaLower() {
+  std::bitset<128> out{};
+  for (char c = 'a'; c <= 'z'; ++c)
+    out.set(c);
+  return out;
+}
+
+consteval std::bitset<128> AlphaUpper() {
+  std::bitset<128> out{};
+  for (char c = 'A'; c <= 'Z'; ++c)
+    out.set(c);
+  return out;
+}
+
+consteval std::bitset<128> Digits() {
+  std::bitset<128> out{};
+  for (char c = '0'; c <= '9'; ++c)
+    out.set(c);
+  return out;
+}
+
+consteval std::bitset<128> Whitespace() {
+  std::bitset<128> out{};
+  out.set(' ');
+  out.set('\f');
   out.set('\n');
   out.set('\r');
   out.set('\t');
+  out.set('\v');
   return out;
+}
+
+}; // namespace PresetCharClass
+
+/// @brief Produce a bitset that clears any non-printable control chars
+consteval std::bitset<128> CtrlCharMask() {
+  return ~std::bitset<128>{0xFFFFFFFF} | PresetCharClass::Whitespace();
 }
 
 /** @brief Represents a state in the DFA as a set of positions. Currently hashes
@@ -322,7 +354,7 @@ static inline size_t ParseSubExpr(ParsingContext &ctx,
   auto add_char_class_rules = [&](std::bitset<128> &&bs) {
     // Clear positions for control chars that shouldn't be allowed (all other
     // than \n, \r, \t)
-    bs &= ContCharMask();
+    bs &= CtrlCharMask();
 
     Rules::Union new_rule{};
 
@@ -340,136 +372,172 @@ static inline size_t ParseSubExpr(ParsingContext &ctx,
   };
 
   while (s_it < s_end) {
-    switch (*s_it) {
-    case '(':
-      complete.emplace_back(ParseSubExpr(ctx, ++s_it, s_end, group_depth + 1));
-      break;
-    case ')': {
-      if (group_depth == 0)
-        throw std::invalid_argument(
-            "Closing parenthesis without corresponding open parenthesis");
-      summarize_complete();
-      return complete.back();
-    } break;
-    case '|': {
-      if (complete.empty() || (++s_it >= s_end))
-        throw std::invalid_argument("Regex-or operator missing an operand");
-
-      summarize_complete();
-
-      size_t left_expr = complete.back();
-      complete.pop_back();
-
-      ctx.rules.emplace_back(std::in_place_type_t<Rules::Union>(), left_expr,
-                             ParseSubExpr(ctx, s_it, s_end, group_depth));
-      return ctx.rules.size() - 1;
-    } break;
-    case '*': {
-      if (complete.empty())
-        throw std::invalid_argument(
-            "Regex zero-or-more operator missing operand");
-
-      ctx.rules.emplace_back(std::in_place_type_t<Rules::Repeat>(),
-                             complete.back());
-      complete.pop_back();
-      complete.emplace_back(ctx.rules.size() - 1);
-    } break;
-    case '.': {
-      ctx.pos_map.emplace_back(ANY_CHAR);
-      ctx.rules.emplace_back(std::in_place_type_t<Rules::Any>(), ctx.pos_cnt++);
-      complete.emplace_back(ctx.rules.size() - 1);
-    } break;
-    case '[': {
-      if ((s_it + 1) >= s_end)
-        throw std::invalid_argument("Unclosed character class");
-      else if (*(s_it + 1) == ']')
-        throw std::invalid_argument("Empty character class is not allowed");
-
-      CharRes res;
-
-      // Advance off '['
-      s_it++;
-
-      res = ProcAdvance(s_it, s_end);
-      const bool inverted = (!res.escaped && (res.c == '^'));
-
-      // Need to step back s_it if not inverted, else we skip it
-      s_it -= inverted ? 0 : 1;
-
-      // Track a bitset of the allowed characters, then add them as
-      // rules once completely done so that negation is easily handled
-      std::bitset<128> included_chars{};
-
-      std::optional<CharRes> last_res = std::nullopt;
-      CharRes cur_res;
-
-      while ((s_it < s_end) && (*s_it != ']')) {
-        cur_res = ProcAdvance(s_it, s_end);
-
-        if (!last_res) {
-          last_res = cur_res;
-          continue;
-        }
-
-        if (!cur_res.escaped && (cur_res.c == '-')) {
-          auto [next_char, next_escaped] = ProcAdvance(s_it, s_end);
-
-          if (last_res->escaped || next_escaped)
-            throw std::invalid_argument(
-                "Escaped characters not allowed in character-class range");
-
-          if (last_res->c > next_char)
-            throw std::invalid_argument(
-                "Negative character-class range is not allowed");
-
-          for (char c = last_res->c; c <= next_char; ++c)
-            included_chars.set(c);
-
-          last_res = std::nullopt;
-        } else {
-          included_chars.set(last_res->c);
-          last_res = cur_res;
-        }
+    auto [cur_char, escaped] = ProcAdvance(s_it, s_end);
+    if (escaped) {
+      switch (cur_char) {
+        using namespace PresetCharClass;
+      case 'd': {
+        add_char_class_rules(Digits());
+      } break;
+      case 'D': {
+        add_char_class_rules(~Digits());
+      } break;
+      case 'w': {
+        add_char_class_rules(AlphaLower() | AlphaUpper() | Digits());
+      } break;
+      case 'W': {
+        add_char_class_rules(~(AlphaLower() | AlphaUpper() | Digits()));
+      } break;
+      case 'l': {
+        add_char_class_rules(AlphaLower() | AlphaUpper());
+      } break;
+      case 'L': {
+        add_char_class_rules(~(AlphaLower() | AlphaUpper()));
+      } break;
+      case 's': {
+        add_char_class_rules(Whitespace());
+      } break;
+      case 'S': {
+        add_char_class_rules(~Whitespace());
+      } break;
+      default: {
+        ctx.pos_map.emplace_back(cur_char);
+        ctx.rules.emplace_back(std::in_place_type_t<Rules::Char>(), cur_char,
+                               ctx.pos_cnt++);
+        complete.emplace_back(ctx.rules.size() - 1);
+      } break;
       }
+    } else {
+      switch (cur_char) {
+      case '(':
+        complete.emplace_back(ParseSubExpr(ctx, s_it, s_end, group_depth + 1));
+        break;
+      case ')': {
+        if (group_depth == 0)
+          throw std::invalid_argument(
+              "Closing parenthesis without corresponding open parenthesis");
+        summarize_complete();
+        return complete.back();
+      } break;
+      case '|': {
+        if (complete.empty() || (s_it >= s_end))
+          throw std::invalid_argument("Regex-or operator missing an operand");
 
-      if (*s_it != ']')
-        throw std::invalid_argument("Unclosed character class");
+        summarize_complete();
 
-      // Move off of ']'
-      s_it++;
+        size_t left_expr = complete.back();
+        complete.pop_back();
 
-      if (last_res)
-        included_chars.set(last_res->c);
+        ctx.rules.emplace_back(std::in_place_type_t<Rules::Union>(), left_expr,
+                               ParseSubExpr(ctx, s_it, s_end, group_depth));
+        return ctx.rules.size() - 1;
+      } break;
+      case '*': {
+        if (complete.empty())
+          throw std::invalid_argument(
+              "Regex zero-or-more operator missing operand");
 
-      included_chars = inverted ? ~included_chars : included_chars;
-      add_char_class_rules(std::move(included_chars));
-    } break;
-    case END_CHAR: {
-      // Patterns joined as augmented regexes w/ ((r1)\0)|((r2)\0)|...|((rn)\0)
-      // We handle this, not the user, so protect these w/ asserts not errs.
-      assert((((s_it + 1) < s_end),
-              "final end marker must be followed by a closing parenthesis"));
-      assert(((*(s_it + 1) == ')'),
-              "end marker must be followed by a closing parenthesis"));
-      assert(((((s_it + 2) < s_end) ? (*(s_it + 2) == '|') : true),
-              "non-final augmented pattern must be followed by a union"));
+        ctx.rules.emplace_back(std::in_place_type_t<Rules::Repeat>(),
+                               complete.back());
+        complete.pop_back();
+        complete.emplace_back(ctx.rules.size() - 1);
+      } break;
+      case '.': {
+        ctx.pos_map.emplace_back(ANY_CHAR);
+        ctx.rules.emplace_back(std::in_place_type_t<Rules::Any>(),
+                               ctx.pos_cnt++);
+        complete.emplace_back(ctx.rules.size() - 1);
+      } break;
+      case '[': {
+        if (s_it >= s_end)
+          throw std::invalid_argument("Unclosed character class");
+        else if (*s_it == ']')
+          throw std::invalid_argument("Empty character class is not allowed");
 
-      ctx.pos_map.emplace_back(END_CHAR);
-      ctx.end_marker_map.emplace(ctx.pos_cnt, ctx.end_marker_map.size());
+        CharRes res;
 
-      ctx.rules.emplace_back(std::in_place_type_t<Rules::EndMarker>(),
-                             ctx.pos_cnt++);
-      complete.emplace_back(ctx.rules.size() - 1);
-    } break;
-    default: {
-      ctx.pos_map.emplace_back(*s_it);
-      ctx.rules.emplace_back(std::in_place_type_t<Rules::Char>(), *s_it,
-                             ctx.pos_cnt++);
-      complete.emplace_back(ctx.rules.size() - 1);
-    } break;
-      // TODO: '+', '?', '[...]', '[^...]', escaped chars
+        res = ProcAdvance(s_it, s_end);
+        const bool inverted = (!res.escaped && (res.c == '^'));
+
+        // Need to step back s_it if not inverted, else we skip it
+        s_it -= inverted ? 0 : 1;
+
+        // Track a bitset of the allowed characters, then add them as
+        // rules once completely done so that negation is easily handled
+        std::bitset<128> included_chars{};
+
+        std::optional<CharRes> last_res = std::nullopt;
+        CharRes cur_res;
+
+        while ((s_it < s_end) && (*s_it != ']')) {
+          cur_res = ProcAdvance(s_it, s_end);
+
+          if (!last_res) {
+            last_res = cur_res;
+            continue;
+          }
+
+          if (!cur_res.escaped && (cur_res.c == '-')) {
+            auto [next_char, next_escaped] = ProcAdvance(s_it, s_end);
+
+            if (last_res->escaped || next_escaped)
+              throw std::invalid_argument(
+                  "Escaped characters not allowed in character-class range");
+
+            if (last_res->c > next_char)
+              throw std::invalid_argument(
+                  "Negative character-class range is not allowed");
+
+            for (char c = last_res->c; c <= next_char; ++c)
+              included_chars.set(c);
+
+            last_res = std::nullopt;
+          } else {
+            included_chars.set(last_res->c);
+            last_res = cur_res;
+          }
+        }
+
+        if (*s_it != ']')
+          throw std::invalid_argument("Unclosed character class");
+
+        // Move off of ']'
+        s_it++;
+
+        if (last_res)
+          included_chars.set(last_res->c);
+
+        included_chars = inverted ? ~included_chars : included_chars;
+        add_char_class_rules(std::move(included_chars));
+      } break;
+      case END_CHAR: {
+        // Patterns joined as augmented regexes w/
+        // ((r1)\0)|((r2)\0)|...|((rn)\0) We handle this, not the user, so
+        // protect these w/ asserts not errs.
+        assert(((s_it < s_end),
+                "final end marker must be followed by a closing parenthesis"));
+
+        assert(((*s_it == ')'),
+                "end marker must be followed by a closing parenthesis"));
+
+        assert(((((s_it + 1) < s_end) ? (*(s_it + 1) == '|') : true),
+                "non-final augmented pattern must be followed by a union"));
+
+        ctx.pos_map.emplace_back(END_CHAR);
+        ctx.end_marker_map.emplace(ctx.pos_cnt, ctx.end_marker_map.size());
+
+        ctx.rules.emplace_back(std::in_place_type_t<Rules::EndMarker>(),
+                               ctx.pos_cnt++);
+        complete.emplace_back(ctx.rules.size() - 1);
+      } break;
+      default: {
+        ctx.pos_map.emplace_back(cur_char);
+        ctx.rules.emplace_back(std::in_place_type_t<Rules::Char>(), cur_char,
+                               ctx.pos_cnt++);
+        complete.emplace_back(ctx.rules.size() - 1);
+      } break;
+      }
     }
-    s_it++;
   }
 
   if (complete.empty())
