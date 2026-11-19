@@ -1,11 +1,15 @@
 #pragma once
 
 #include <array>
+#include <bitset>
 #include <cassert>
+#include <climits>
 #include <cstddef>
 #include <deque>
 #include <queue>
 #include <set>
+#include <stdexcept>
+#include <string_view>
 #include <tuple>
 #include <unordered_map>
 #include <utility>
@@ -29,6 +33,15 @@ static constexpr char END_CHAR = char{0};
 
 /// @brief Character used to represent the '.' "any" character
 static constexpr char ANY_CHAR = char{26};
+
+consteval std::bitset<128> ContCharMask() {
+  std::bitset<128> out{0xFFFFFFFF};
+  out.flip();
+  out.set('\n');
+  out.set('\r');
+  out.set('\t');
+  return out;
+}
 
 /** @brief Represents a state in the DFA as a set of positions. Currently hashes
  * by concatenating positions as strings, delimited by ":", and calculating the
@@ -242,6 +255,47 @@ static inline Rules::Rule &SolveTree(std::vector<Rules::Rule> &rules,
   return rule;
 }
 
+struct CharRes {
+  char c;
+  bool escaped;
+};
+
+static inline CharRes ProcChar(std::string_view::const_iterator const &s_it,
+                               std::string_view::const_iterator const &s_end) {
+  // Reads current
+  if (s_it >= s_end)
+    throw std::invalid_argument("Tried to process char past the end of input");
+
+  if (*s_it == '\\') {
+    if ((s_it + 1) >= s_end)
+      throw std::invalid_argument(
+          "Tried to process escaped char past the end of input");
+
+    const char c = *(s_it + 1);
+    switch (c) {
+    case 'n':
+      return {'\n', true};
+    case 'r':
+      return {'\r', true};
+    case 't':
+      return {'\t', true};
+    default:
+      return {c, true};
+    }
+  } else {
+    return {*s_it, false};
+  }
+}
+
+static inline CharRes
+ProcAdvance(std::string_view::const_iterator &s_it,
+            std::string_view::const_iterator const &s_end) {
+  // Reads current, advances just after current
+  CharRes res = ProcChar(s_it, s_end);
+  s_it += (1 + res.escaped);
+  return res;
+}
+
 static inline size_t ParseSubExpr(ParsingContext &ctx,
                                   std::string_view::const_iterator &s_it,
                                   std::string_view::const_iterator const &s_end,
@@ -263,6 +317,28 @@ static inline size_t ParseSubExpr(ParsingContext &ctx,
       complete.emplace_front(ctx.rules.size() - 1);
     }
   };
+
+  // Procedure to build and add the rules for a bitset representing a char class
+  auto add_char_class_rules = [&](std::bitset<128> &&bs) {
+    // Clear positions for control chars that shouldn't be allowed (all other
+    // than \n, \r, \t)
+    bs &= ContCharMask();
+
+    Rules::Union new_rule{};
+
+    for (char c = 0; c < 127; ++c) {
+      if (bs.test(c)) {
+        ctx.pos_map.emplace_back(c);
+        ctx.rules.emplace_back(std::in_place_type_t<Rules::Char>(), c,
+                               ctx.pos_cnt++);
+        new_rule.children.emplace_back(ctx.rules.size() - 1);
+      }
+    }
+
+    ctx.rules.emplace_back(std::move(new_rule));
+    complete.emplace_back(ctx.rules.size() - 1);
+  };
+
   while (s_it < s_end) {
     switch (*s_it) {
     case '(':
@@ -302,6 +378,71 @@ static inline size_t ParseSubExpr(ParsingContext &ctx,
       ctx.pos_map.emplace_back(ANY_CHAR);
       ctx.rules.emplace_back(std::in_place_type_t<Rules::Any>(), ctx.pos_cnt++);
       complete.emplace_back(ctx.rules.size() - 1);
+    } break;
+    case '[': {
+      if ((s_it + 1) >= s_end)
+        throw std::invalid_argument("Unclosed character class");
+      else if (*(s_it + 1) == ']')
+        throw std::invalid_argument("Empty character class is not allowed");
+
+      CharRes res;
+
+      // Advance off '['
+      s_it++;
+
+      res = ProcAdvance(s_it, s_end);
+      const bool inverted = (!res.escaped && (res.c == '^'));
+
+      // Need to step back s_it if not inverted, else we skip it
+      s_it -= inverted ? 0 : 1;
+
+      // Track a bitset of the allowed characters, then add them as
+      // rules once completely done so that negation is easily handled
+      std::bitset<128> included_chars{};
+
+      std::optional<CharRes> last_res = std::nullopt;
+      CharRes cur_res;
+
+      while ((s_it < s_end) && (*s_it != ']')) {
+        cur_res = ProcAdvance(s_it, s_end);
+
+        if (!last_res) {
+          last_res = cur_res;
+          continue;
+        }
+
+        if (!cur_res.escaped && (cur_res.c == '-')) {
+          auto [next_char, next_escaped] = ProcAdvance(s_it, s_end);
+
+          if (last_res->escaped || next_escaped)
+            throw std::invalid_argument(
+                "Escaped characters not allowed in character-class range");
+
+          if (last_res->c > next_char)
+            throw std::invalid_argument(
+                "Negative character-class range is not allowed");
+
+          for (char c = last_res->c; c <= next_char; ++c)
+            included_chars.set(c);
+
+          last_res = std::nullopt;
+        } else {
+          included_chars.set(last_res->c);
+          last_res = cur_res;
+        }
+      }
+
+      if (*s_it != ']')
+        throw std::invalid_argument("Unclosed character class");
+
+      // Move off of ']'
+      s_it++;
+
+      if (last_res)
+        included_chars.set(last_res->c);
+
+      included_chars = inverted ? ~included_chars : included_chars;
+      add_char_class_rules(std::move(included_chars));
     } break;
     case END_CHAR: {
       // Patterns joined as augmented regexes w/ ((r1)\0)|((r2)\0)|...|((rn)\0)
