@@ -442,6 +442,18 @@ static inline size_t ParseSubExpr(ParsingContext &ctx,
         complete.pop_back();
         complete.emplace_back(ctx.rules.size() - 1);
       } break;
+      case '+': {
+        if (complete.empty())
+          throw std::invalid_argument(
+              "Regex zero-or-more operator missing operand");
+
+        ctx.rules.emplace_back(std::in_place_type_t<Rules::Repeat>(),
+                               complete.back());
+        ctx.rules.emplace_back(std::in_place_type_t<Rules::Concat>(),
+                               complete.back(), ctx.rules.size() - 1);
+        complete.pop_back();
+        complete.emplace_back(ctx.rules.size() - 1);
+      } break;
       case '.': {
         ctx.pos_map.emplace_back(ANY_CHAR);
         ctx.rules.emplace_back(std::in_place_type_t<Rules::Any>(),
