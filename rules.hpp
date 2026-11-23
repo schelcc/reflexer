@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <flat_set>
 #include <list>
 #include <meta>
 #include <optional>
@@ -18,19 +19,19 @@ struct Char {
 struct Union {
   std::vector<size_t> children{};
 
-  Union() = default;
+  constexpr Union() = default;
 
-  Union(size_t l) : children({l}) {}
-  Union(size_t l, size_t r) : children({l, r}) {}
+  constexpr Union(size_t l) : children({l}) {}
+  constexpr Union(size_t l, size_t r) : children({l, r}) {}
 };
 
 struct Concat {
   std::optional<size_t> left_child;
   std::optional<size_t> right_child;
 
-  Concat() = default;
-  Concat(size_t l) : left_child(l), right_child(std::nullopt) {}
-  Concat(size_t l, size_t r) : left_child(l), right_child(r) {}
+  constexpr Concat() = default;
+  constexpr Concat(size_t l) : left_child(l), right_child(std::nullopt) {}
+  constexpr Concat(size_t l, size_t r) : left_child(l), right_child(r) {}
 };
 
 struct Repeat {
@@ -39,11 +40,12 @@ struct Repeat {
   size_t min_repeat;
   std::optional<size_t> max_repeat;
 
-  Repeat() = default;
-  Repeat(size_t c) : child(c), min_repeat(0), max_repeat(std::nullopt) {}
-  Repeat(size_t c, size_t r)
+  constexpr Repeat() = default;
+  constexpr Repeat(size_t c)
+      : child(c), min_repeat(0), max_repeat(std::nullopt) {}
+  constexpr Repeat(size_t c, size_t r)
       : child(c), min_repeat(r), max_repeat(std::nullopt) {}
-  Repeat(size_t c, size_t r, size_t m)
+  constexpr Repeat(size_t c, size_t r, size_t m)
       : child(c), min_repeat(r), max_repeat(m) {}
 };
 
@@ -66,14 +68,14 @@ struct Rule : RuleTypes {
   using RuleTypes::variant;
 
   std::optional<bool> nullable = std::nullopt;
-  std::optional<std::set<size_t>> firstpos = std::nullopt;
-  std::optional<std::set<size_t>> lastpos = std::nullopt;
+  std::optional<std::flat_set<size_t>> firstpos = std::nullopt;
+  std::optional<std::flat_set<size_t>> lastpos = std::nullopt;
 
-  template <typename Alt> [[nodiscard]] bool is() {
+  template <typename Alt> [[nodiscard]] constexpr bool is() {
     return std::holds_alternative<Alt>(*this);
   }
 
-  template <typename Alt> [[nodiscard]] auto &&as(this auto &&self) {
+  template <typename Alt> [[nodiscard]] constexpr auto &&as(this auto &&self) {
     return std::forward_like<decltype(self)>(std::get<Alt>(self));
   }
 };

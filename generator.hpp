@@ -6,15 +6,18 @@
 #include <climits>
 #include <cstddef>
 #include <deque>
+#include <flat_map>
+#include <flat_set>
+#include <meta>
 #include <queue>
 #include <set>
 #include <stdexcept>
 #include <string_view>
 #include <tuple>
-#include <unordered_map>
 #include <utility>
 
 #include "rules.hpp"
+#include "tools.hpp"
 
 namespace Reflexer::Generator {
 
@@ -22,14 +25,14 @@ namespace Reflexer::Generator {
 using TransitionMap = std::array<int, 128>;
 
 /// @brief Maps positions in the tree to positions which can follow
-using PositionSet = std::vector<std::set<size_t>>;
+using PositionSet = std::vector<std::flat_set<size_t>>;
 
 /// @brief Maps position index to the character in the regex it represents
 using PositionMap = std::vector<char>;
 
 /// @brief Character used in the augmented regexes to represent the
 /// end of an individual token
-static constexpr char END_CHAR = char{0};
+static constexpr char END_CHAR = char{1};
 
 /// @brief Character used to represent the '.' "any" character
 static constexpr char ANY_CHAR = char{26};
@@ -85,75 +88,59 @@ consteval std::bitset<128> CtrlCharMask() {
  * Later improvement by selecting a different hashing approach would eliminate
  * need for both string and an ordered set. */
 struct DFAState {
-  std::set<size_t> positions{};
+  std::flat_set<size_t> positions{};
 
-  [[nodiscard]] bool operator==(DFAState const &other) const noexcept {
-    return positions == other.positions;
-  }
-
-  operator std::string() const {
-    std::string out = "";
-    if (positions.empty())
-      return out;
-
-    for (size_t pos : positions)
-      out += std::to_string(pos) + ":";
-
-    out.pop_back();
-    return out;
-  }
+  constexpr bool operator==(DFAState const &) const = default;
 };
 
 struct DFA {
   std::vector<TransitionMap> transitions;
-  std::unordered_map<size_t, size_t> accepting_states; // state -> pattern num
+  std::vector<Methods::Pair<size_t, size_t>> accepting_states;
+};
+
+struct DFAView {
+  std::span<const TransitionMap> transitions;
+  std::span<const Methods::Pair<size_t, size_t>> accepting_states;
+  std::string_view pattern{};
 };
 
 }; // namespace Reflexer::Generator
-
-namespace std {
-template <> struct hash<Reflexer::Generator::DFAState> {
-  inline size_t operator()(Reflexer::Generator::DFAState const &s) const {
-    return hash<string>{}(s);
-  }
-};
-}; // namespace std
 
 namespace Reflexer::Generator {
 
 struct ParsingContext {
   std::vector<Rules::Rule> rules{};
-  std::vector<std::set<size_t>> pos_set{};
+  std::vector<std::flat_set<size_t>> pos_set{};
   std::vector<char> pos_map{};
-  std::unordered_map<size_t, size_t> end_marker_map{}; // pos. -> pattern num
+  std::flat_map<size_t, size_t> end_marker_map{};
   int pos_cnt = 0;
 };
 
-static inline DFA BuildDFA(ParsingContext const &ctx, size_t const root_ptr) {
+consteval DFA BuildDFA(ParsingContext const &ctx, size_t const root_ptr) {
   DFA dfa{};
 
   // The amount of information in DFAState objects is not necessary after
   // construction, so maintain a temporary mapping of DFAStates to transition
   // indices
-  std::unordered_map<DFAState, size_t> state_map{};
+  std::vector<DFAState> state_map{};
 
-  std::queue<DFAState> to_visit{};
+  std::vector<DFAState> to_visit{};
 
   auto &root_rule = ctx.rules.at(root_ptr);
-  to_visit.emplace(*root_rule.firstpos);
-  state_map.emplace(*root_rule.firstpos, 0);
+  to_visit.emplace_back(*root_rule.firstpos);
+  state_map.emplace_back(*root_rule.firstpos);
 
   // Back of dfa.transitions should always be the "current" state
   dfa.transitions.emplace_back();
   dfa.transitions.back().fill(-1);
 
   while (!to_visit.empty()) {
-    DFAState state = to_visit.front();
-    to_visit.pop();
+    DFAState state = to_visit.back();
+    to_visit.pop_back();
 
-    size_t state_idx = state_map.at(state);
+    const size_t state_idx = Methods::index_of(state_map, state).value();
 
-    std::unordered_map<char, std::set<size_t>> char_to_pos_set{};
+    std::flat_map<char, std::flat_set<size_t>> char_to_pos_set{};
 
     // Group all positions in this state by their corresponding character
     for (size_t pos : state.positions) {
@@ -166,8 +153,7 @@ static inline DFA BuildDFA(ParsingContext const &ctx, size_t const root_ptr) {
     if (endmark_it != char_to_pos_set.end()) {
       // Intuitively this should hold but I don't yet know why. But I
       // rely on it for the next step so protect it.
-      assert(endmark_it->second.size() == 1);
-      dfa.accepting_states.emplace(
+      dfa.accepting_states.emplace_back(
           state_idx, ctx.end_marker_map.at(*endmark_it->second.begin()));
       char_to_pos_set.erase(END_CHAR);
     }
@@ -175,22 +161,25 @@ static inline DFA BuildDFA(ParsingContext const &ctx, size_t const root_ptr) {
     for (auto [c, positions] : char_to_pos_set) {
       DFAState new_state{};
 
+      // TODO : This winds up incurring a CRAZY number of operations
       for (size_t pos : positions)
-        new_state.positions.insert_range(ctx.pos_set.at(pos));
+        new_state.positions.insert_range(ctx.pos_set[pos]);
 
-      auto [iter, is_new_state] =
-          state_map.try_emplace(new_state, dfa.transitions.size());
+      std::optional<size_t> new_state_idx =
+          Methods::index_of(state_map, new_state);
 
-      if (is_new_state) {
+      if (!new_state_idx.has_value()) {
         dfa.transitions.emplace_back();
         dfa.transitions.back().fill(-1);
-        to_visit.emplace(std::move(new_state));
+        state_map.emplace_back(new_state);
+        to_visit.emplace(to_visit.begin(), std::move(new_state));
+        new_state_idx.emplace(dfa.transitions.size() - 1);
       }
 
-      dfa.transitions.at(state_idx).at(c) = iter->second;
+      dfa.transitions.at(state_idx).at(c) = *new_state_idx;
       if (c == ANY_CHAR) {
         auto &trans = dfa.transitions.at(state_idx);
-        auto next = iter->second;
+        auto next = *new_state_idx;
 
         for (char i = 32; i < 127; ++i)
           trans[i] = next;
@@ -204,16 +193,16 @@ static inline DFA BuildDFA(ParsingContext const &ctx, size_t const root_ptr) {
   return dfa;
 }
 
-static inline Rules::Rule &SolveTree(std::vector<Rules::Rule> &rules,
-                                     PositionSet &followpos,
-                                     size_t const root_ptr) {
+consteval Rules::Rule &SolveTree(std::vector<Rules::Rule> &rules,
+                                 PositionSet &followpos,
+                                 size_t const root_ptr) {
   struct Vis {
     Rules::Rule &enclosing_rule;
 
     std::vector<Rules::Rule> &rules;
     PositionSet &followpos;
 
-    void operator()(Rules::Union &r) {
+    consteval void operator()(Rules::Union &r) {
       enclosing_rule.nullable = false;
       enclosing_rule.firstpos.emplace();
       enclosing_rule.lastpos.emplace();
@@ -226,7 +215,7 @@ static inline Rules::Rule &SolveTree(std::vector<Rules::Rule> &rules,
         enclosing_rule.lastpos->insert_range(*child_rule.lastpos);
       }
     }
-    void operator()(Rules::Concat &r) {
+    consteval void operator()(Rules::Concat &r) {
 
       assert(r.left_child.has_value() && r.right_child.has_value());
 
@@ -252,7 +241,7 @@ static inline Rules::Rule &SolveTree(std::vector<Rules::Rule> &rules,
       for (size_t i : *left.lastpos)
         followpos.at(i).insert_range(*right.firstpos);
     }
-    void operator()(Rules::Repeat &r) {
+    consteval void operator()(Rules::Repeat &r) {
       // For now, only going to handle kleene (min 0, max null)
       assert(r.child.has_value() && !r.max_repeat.has_value());
 
@@ -268,22 +257,22 @@ static inline Rules::Rule &SolveTree(std::vector<Rules::Rule> &rules,
       for (size_t i : *child.lastpos)
         followpos.at(i).insert_range(*enclosing_rule.firstpos);
     }
-    void operator()(Rules::Char &r) {
+    consteval void operator()(Rules::Char &r) {
       enclosing_rule.nullable = false;
       enclosing_rule.firstpos = {r.pos};
       enclosing_rule.lastpos = {r.pos};
     }
-    void operator()(Rules::Any &r) {
+    consteval void operator()(Rules::Any &r) {
       enclosing_rule.nullable = false;
       enclosing_rule.firstpos = {r.pos};
       enclosing_rule.lastpos = {r.pos};
     }
-    void operator()(Rules::EmptyPos &r) {
+    consteval void operator()(Rules::EmptyPos &r) {
       enclosing_rule.nullable = true;
       enclosing_rule.firstpos.emplace();
       enclosing_rule.lastpos.emplace();
     }
-    void operator()(Rules::EndMarker &r) {
+    consteval void operator()(Rules::EndMarker &r) {
       enclosing_rule.nullable = false;
       enclosing_rule.firstpos = {r.pos};
       enclosing_rule.lastpos = {r.pos};
@@ -300,8 +289,8 @@ struct CharRes {
   bool escaped;
 };
 
-static inline CharRes ProcChar(std::string_view::const_iterator const &s_it,
-                               std::string_view::const_iterator const &s_end) {
+consteval CharRes ProcChar(std::string_view::const_iterator const &s_it,
+                           std::string_view::const_iterator const &s_end) {
   // Reads current
   if (s_it >= s_end)
     throw std::invalid_argument("Tried to process char past the end of input");
@@ -327,34 +316,30 @@ static inline CharRes ProcChar(std::string_view::const_iterator const &s_it,
   }
 }
 
-static inline CharRes
-ProcAdvance(std::string_view::const_iterator &s_it,
-            std::string_view::const_iterator const &s_end) {
+consteval CharRes ProcAdvance(std::string_view::const_iterator &s_it,
+                              std::string_view::const_iterator const &s_end) {
   // Reads current, advances just after current
   CharRes res = ProcChar(s_it, s_end);
   s_it += (1 + res.escaped);
   return res;
 }
 
-static inline size_t ParseSubExpr(ParsingContext &ctx,
-                                  std::string_view::const_iterator &s_it,
-                                  std::string_view::const_iterator const &s_end,
-                                  int group_depth = 0) {
-  std::deque<size_t> complete{};
+consteval size_t ParseSubExpr(ParsingContext &ctx,
+                              std::string_view::const_iterator &s_it,
+                              std::string_view::const_iterator const &s_end,
+                              int group_depth = 0) {
+  Methods::Deque<size_t> complete{};
 
   // Procedure to bottom-to-top concatenate rules, leaving just one rule on the
   // complete stack
   auto summarize_complete = [&] {
     while (complete.size() > 1) {
-      size_t left_expr = complete.front();
-      complete.pop_front();
-
-      size_t right_expr = complete.front();
-      complete.pop_front();
+      size_t left_expr = complete.dequeue_front();
+      size_t right_expr = complete.dequeue_front();
 
       ctx.rules.emplace_back(std::in_place_type_t<Rules::Concat>(), left_expr,
                              right_expr);
-      complete.emplace_front(ctx.rules.size() - 1);
+      complete.enqueue_front(ctx.rules.size() - 1);
     }
   };
 
@@ -376,7 +361,7 @@ static inline size_t ParseSubExpr(ParsingContext &ctx,
     }
 
     ctx.rules.emplace_back(std::move(new_rule));
-    complete.emplace_back(ctx.rules.size() - 1);
+    complete.enqueue_back(ctx.rules.size() - 1);
   };
 
   while (s_it < s_end) {
@@ -412,13 +397,13 @@ static inline size_t ParseSubExpr(ParsingContext &ctx,
         ctx.pos_map.emplace_back(cur_char);
         ctx.rules.emplace_back(std::in_place_type_t<Rules::Char>(), cur_char,
                                ctx.pos_cnt++);
-        complete.emplace_back(ctx.rules.size() - 1);
+        complete.enqueue_back(ctx.rules.size() - 1);
       } break;
       }
     } else {
       switch (cur_char) {
       case '(': {
-        complete.emplace_back(ParseSubExpr(ctx, s_it, s_end, group_depth + 1));
+        complete.enqueue_back(ParseSubExpr(ctx, s_it, s_end, group_depth + 1));
       } break;
       case ')': {
         if (group_depth == 0)
@@ -433,11 +418,13 @@ static inline size_t ParseSubExpr(ParsingContext &ctx,
 
         summarize_complete();
 
-        size_t left_expr = complete.back();
-        complete.pop_back();
+        size_t left_expr = complete.dequeue_back();
 
         ctx.rules.emplace_back(std::in_place_type_t<Rules::Union>(), left_expr,
                                ParseSubExpr(ctx, s_it, s_end, group_depth));
+
+        complete.enqueue_back(ctx.rules.size() - 1);
+
         return ctx.rules.size() - 1;
       } break;
       case '*': {
@@ -447,8 +434,9 @@ static inline size_t ParseSubExpr(ParsingContext &ctx,
 
         ctx.rules.emplace_back(std::in_place_type_t<Rules::Repeat>(),
                                complete.back());
-        complete.pop_back();
-        complete.emplace_back(ctx.rules.size() - 1);
+
+        complete.dequeue_back();
+        complete.enqueue_back(ctx.rules.size() - 1);
       } break;
       case '+': {
         // Concatenation of "<pattern>" and "<pattern>*"
@@ -460,8 +448,8 @@ static inline size_t ParseSubExpr(ParsingContext &ctx,
                                complete.back());
         ctx.rules.emplace_back(std::in_place_type_t<Rules::Concat>(),
                                complete.back(), ctx.rules.size() - 1);
-        complete.pop_back();
-        complete.emplace_back(ctx.rules.size() - 1);
+        complete.dequeue_back();
+        complete.enqueue_back(ctx.rules.size() - 1);
       } break;
       case '?': {
         // Union of "<pattern>" and ""
@@ -469,21 +457,20 @@ static inline size_t ParseSubExpr(ParsingContext &ctx,
           throw std::invalid_argument(
               "Regex zero-or-more operator missing operand");
 
-        size_t nullable_pat = complete.back();
-        complete.pop_back();
+        size_t nullable_pat = complete.dequeue_back();
 
         ctx.pos_map.emplace_back(EMPTY_CHAR);
         ctx.rules.emplace_back(std::in_place_type_t<Rules::EmptyPos>(),
                                ctx.pos_cnt++);
         ctx.rules.emplace_back(std::in_place_type_t<Rules::Union>(),
                                ctx.rules.size() - 1, nullable_pat);
-        complete.emplace_back(ctx.rules.size() - 1);
+        complete.enqueue_back(ctx.rules.size() - 1);
       } break;
       case '.': {
         ctx.pos_map.emplace_back(ANY_CHAR);
         ctx.rules.emplace_back(std::in_place_type_t<Rules::Any>(),
                                ctx.pos_cnt++);
-        complete.emplace_back(ctx.rules.size() - 1);
+        complete.enqueue_back(ctx.rules.size() - 1);
       } break;
       case '[': {
         if (s_it >= s_end)
@@ -565,13 +552,13 @@ static inline size_t ParseSubExpr(ParsingContext &ctx,
 
         ctx.rules.emplace_back(std::in_place_type_t<Rules::EndMarker>(),
                                ctx.pos_cnt++);
-        complete.emplace_back(ctx.rules.size() - 1);
+        complete.enqueue_back(ctx.rules.size() - 1);
       } break;
       default: {
         ctx.pos_map.emplace_back(cur_char);
         ctx.rules.emplace_back(std::in_place_type_t<Rules::Char>(), cur_char,
                                ctx.pos_cnt++);
-        complete.emplace_back(ctx.rules.size() - 1);
+        complete.enqueue_back(ctx.rules.size() - 1);
       } break;
       }
     }
@@ -584,7 +571,7 @@ static inline size_t ParseSubExpr(ParsingContext &ctx,
   return complete.back();
 }
 
-static inline std::pair<size_t, ParsingContext>
+consteval Methods::Pair<size_t, ParsingContext>
 ParseExpr(std::string_view const s) {
   ParsingContext ctx{};
   auto s_it = s.cbegin();
