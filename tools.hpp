@@ -1,11 +1,13 @@
 #pragma once
 
 #include <algorithm>
+#include <compare>
 #include <concepts>
 #include <cstddef>
 #include <expected>
 #include <functional>
 #include <initializer_list>
+#include <iterator>
 #include <optional>
 #include <ranges>
 #include <stdexcept>
@@ -55,77 +57,130 @@ private:
   std::vector<T> _vec{};
 };
 
-template <typename K, typename V>
-  requires(
-      requires(K k) { std::hash<K>{}(k); } &&
-      requires(K k1, K k2) { k1 == k2; })
-struct Map {
-  /** @brief Inserts the value into the table with the given key. Requires that
-   * the key is not already present. */
-  constexpr void insert(K &&k, V &&v) {
-    maybe_rehash();
-    std::size_t idx = find_open(k);
-    _keys[idx].emplace(std::move(k));
-    _vals[idx].emplace(std::move(v));
+template <typename T>
+concept Hashable = requires(T t) { std::hash<T>{}(t); };
+
+template <typename T>
+concept IsEqComparable = requires(T t1, T t2) { t1 == t2; };
+
+/** @brief Iterator type which wraps the iterator of a vector of
+ * std::optional<T>, skipping over any empty indices upon increment/decrement.
+ */
+template <typename T> struct SkippingIterator {
+
+  // Required to hold onto start/end iterators so we can safely deref the vec
+  // iterator to check optional engagement
+  constexpr SkippingIterator(
+      std::vector<std::optional<T>>::iterator &&it,
+      std::vector<std::optional<T>>::iterator const &start_it,
+      std::vector<std::optional<T>>::iterator const &end_it)
+      : _it(std::move(it)), _start_it(start_it), _end_it(end_it) {}
+
+  constexpr SkippingIterator &operator+=(int const amt) {
+    const int step = (amt < 0) ? -1 : 1;
+    int steps = 0;
+    while (steps < amt) {
+      do {
+        _it += step;
+      } while ((_it < _end_it) && !_it->has_value());
+      steps++;
+    }
+    return *this;
+  }
+  constexpr SkippingIterator &operator-=(int const amt) {
+    return operator+=(-amt);
   }
 
-  /** @brief Updates the key with the given value. Requires that the key is
-   * present in the table, throwing if not. */
-  constexpr void update(K const &k, V &&v) {
-    std::optional<std::size_t> idx = find(k);
-    if (!idx.has_value())
-      throw std::invalid_argument("Key not in table");
-    _vals[idx].emplace(std::move(v));
+  constexpr SkippingIterator &operator--() { return *this -= 1; }
+  constexpr SkippingIterator operator--(int) {
+    auto ret = *this;
+    *this -= 1;
+    return ret;
   }
 
-  /** @brief Either updates or inserts the value in the table according to
-   * whether the key was already present or not. Returns boolean indicating
-   * whether the key was inserted. */
-  template <typename U> constexpr bool insert_or_update(U &&u, V &&v) {
+  /* required by weakly_incrementable */
+  using difference_type = std::ptrdiff_t;
+  constexpr SkippingIterator &operator++() { return *this += 1; }
+  constexpr SkippingIterator operator++(int) {
+    auto ret = *this;
+    *this += 1;
+    return ret;
+  }
+
+  /* required by indirectly_readable */
+  using value_type = T;
+  constexpr auto &&operator*(this auto &&self) {
+    return std::forward_like<decltype(self)>(self._it)->value();
+  }
+
+  /* required by WeakEqualityComparable (expositional concept, required I is
+   * equality comparable with itself) */
+  [[nodiscard]] bool operator==(SkippingIterator const &o) const {
+    return _it == o._it;
+  }
+  [[nodiscard]] bool operator!=(SkippingIterator const &o) const {
+    return _it != o._it;
+  }
+  [[nodiscard]] std::weak_ordering
+  operator<=>(SkippingIterator const &o) const {
+    return _it <=> o._it;
+  }
+
+  constexpr SkippingIterator operator+(int const amt) {
+    auto ret = *this;
+    ret._it += amt;
+    return ret;
+  }
+  constexpr SkippingIterator operator-(int const amt) { return *this + -amt; }
+
+  /* required by semiregular */
+  constexpr SkippingIterator() = default;
+  constexpr SkippingIterator(SkippingIterator const &) = default;
+  constexpr SkippingIterator &operator=(SkippingIterator const i) {
+    _it = i._it;
+    _end_it = i._end_it;
+    _start_it = i._start_it;
+  };
+  constexpr SkippingIterator(SkippingIterator &&) = default;
+  constexpr SkippingIterator &operator=(SkippingIterator &&) = default;
+
+private:
+  [[nodiscard]] constexpr bool inrange_below() const noexcept {
+    return (_it >= _start_it);
+  }
+  [[nodiscard]] constexpr bool inrange_above() const noexcept {
+    return (_it < _end_it);
+  }
+
+  const std::vector<std::optional<T>>::iterator _start_it;
+  const std::vector<std::optional<T>>::iterator _end_it;
+  std::vector<std::optional<T>>::iterator _it;
+};
+
+template <typename K>
+  requires(Hashable<K> && IsEqComparable<K>)
+struct Set {
+  /** @brief Insert the key into the set if not already present. Returns boolean
+   * indicating whether the key was added to the set. */
+  template <typename U> constexpr bool insert(U &&u) {
     auto pos = find(u);
     if (!pos.has_value()) {
       std::size_t idx = pos.error();
       if (maybe_rehash())
         idx = find_open(u);
-
       _keys[idx].emplace(std::forward<U>(u));
-      _vals[idx].emplace(std::move(v));
-      return true;
-    } else {
-      std::size_t idx = pos.value();
-      _vals[idx].emplace(std::move(v));
-      return false;
-    }
-    std::unreachable();
-  }
-
-  /** @brief Insert the value into the table only if the key is not already
-   * present. Does not touch the value if the key is present. Returns boolean
-   * indicating whether the value was added to the table. */
-  template <typename U, typename W> constexpr bool try_insert(U &&u, W &&w) {
-    auto pos = find(u);
-    if (!u.has_value()) {
-      std::size_t idx = u.error();
-
-      if (maybe_rehash())
-        idx = find_open(u);
-
-      _keys[idx].emplace(std::forward<U>(u));
-      _vals[idx].emplace(std::forward<W>(w));
       return true;
     }
     return false;
   }
 
-  /** @brief Remove the entry for the given key, doing nothing if the key is not
-   * present. Returns a boolean indicating whether the key was removed from the
-   * table. */
-  constexpr bool remove(K const &k) noexcept {
+  /** @brief Remove the key from the set if it is present. Returns boolean
+   * indicating whether the key was present and is now removed. */
+  constexpr bool remove(K &&k) {
     auto pos = find(k);
     if (pos.has_value()) {
       std::size_t idx = pos.value();
       _keys[idx].reset();
-      _vals[idx].reset();
       _elements--;
       _load_factor =
           static_cast<double>(_elements) / static_cast<double>(_keys.size());
@@ -134,52 +189,45 @@ struct Map {
     return false;
   }
 
-  /** @brief Remove all entries from the table. */
-  constexpr void clear() noexcept {
+  /** @brief Remove all entries from the set. */
+  constexpr bool clear() {
     _elements = 0;
     _load_factor = 0;
     _keys = std::vector<std::optional<K>>(_keys.size(), std::nullopt);
-    _vals = std::vector<std::optional<V>>(_vals.size(), std::nullopt);
   }
 
-  /** @brief Return a reference to the value at the key, if the key is present
-   * in the table. */
-  constexpr std::optional<V &> at(K const &k) noexcept {
-    auto pos = find(k);
-    if (pos.has_value())
-      return _vals[pos.value()].value();
-    else
-      return std::nullopt;
-  }
+  /** @brief Determine if the set is currently empty. */
+  constexpr bool empty() const noexcept { return _elements == 0; }
 
-  /** @brief Retrieve a reference to the value at the key, throwing if the key
-   * is not present in the table. */
-  constexpr V &at_throwing(K const &k) {
-    auto pos = find(k);
-    if (pos.has_value())
-      return _vals[pos.value()].value();
-    else
-      throw std::invalid_argument("Key is not present in the table");
-  }
-
-  /** @brief Return whether the given key is present in the table. */
-  constexpr bool contains(K const &k) const noexcept {
+  /** @brief Determine if the set contains the given key. */
+  template <typename U> constexpr bool contains(K const &k) const noexcept {
     return find(k).has_value();
   }
 
-  /** @brief Return the number of elements present in the table. */
+  /** @brief Determine the number of elements present in the set. */
   constexpr std::size_t size() const noexcept { return _elements; }
 
-  /** @brief Return the table's current load factor. */
+  /** @brief Determine the number of total slots in the current set. */
+  constexpr std::size_t max_size() const noexcept { return _keys.size(); }
+
+  /** @brief Determine the current load factor of the set. */
   constexpr double load_factor() const noexcept { return _load_factor; }
 
-  /** @brief Return whether the table is empty. */
-  constexpr bool empty() const noexcept { return _elements == 0; }
+  constexpr SkippingIterator<K> begin() {
+    auto it = _keys.begin();
+    while (!it->has_value())
+      it++;
+    return SkippingIterator<K>(std::move(it), _keys.begin(), _keys.end());
+  }
+
+  constexpr SkippingIterator<K> end() {
+    return SkippingIterator<K>(_keys.end(), _keys.begin(), _keys.end());
+  }
 
 private:
-  /** @brief Update the number of elements and load factor, rehashing the table
-   * if the load factor exceeds the configured threshold. Returns a boolean
-   * indicating whether the table was rehashed. */
+  /** @brief Update the number of elements and load factor, rehashing the set if
+   * the load factor exceeds the configured threshold. Returns a boolean
+   * indicating whether the set was rehashed. */
   constexpr bool maybe_rehash() {
     _elements++;
     _load_factor =
@@ -187,16 +235,16 @@ private:
     if (_load_factor >= LOAD_FACTOR_THRESH) {
       rehash();
       return true;
-    } else
-      return false;
+    }
+    return false;
   }
 
-  /** @brief Calculates the hash for the given key. */
+  /** @brief Calculate the hash for the given key. */
   constexpr std::size_t hash(K const &k) const {
     return std::hash<K>{}(k) % _keys.size();
   }
 
-  /** @brief Finds the first open slot for the given key. */
+  /** @brief Find the first open slot for the given key. */
   constexpr std::size_t find_open(K const &k) const {
     std::size_t h = hash(k);
     std::size_t probe = 0;
@@ -208,28 +256,20 @@ private:
   /** @brief Resize and rehash the table. Invalidates all previous indices. */
   constexpr void rehash() {
     auto tmp_keys = std::move(_keys);
-    auto tmp_vals = std::move(_vals);
 
     _keys = std::vector<std::optional<K>>(tmp_keys.size() * 2, std::nullopt);
-    _vals = std::vector<std::optional<V>>(tmp_keys.size() * 2, std::nullopt);
-
     _load_factor /= 2.0;
 
-    for (auto &&[k, v] :
-         std::ranges::zip_view{tmp_keys, tmp_vals} | std::views::as_rvalue) {
-      if (k.has_value()) {
-        std::size_t idx = find_open(k.value());
-        _keys[idx].emplace(std::move(k.value()));
-        _vals[idx].emplace(std::move(v.value()));
-      }
-    }
+    for (auto &&k : std::move(tmp_keys))
+      if (k.has_value())
+        _keys[find_open(k.value())].emplace(std::move(k.value()));
   }
 
   /** @brief Find the given key, or the first open slot at which it could be
    * placed. Returns an expected which contains an index in both states. If the
    * expected is in the error state, the index represents the place at which the
    * key could be placed, otherwise it represents the index of that element in
-   * the table. */
+   * the set. */
   constexpr std::expected<std::size_t, std::size_t> find(K const &k) const {
     std::size_t h = hash(k);
     std::size_t probe = 0;
@@ -256,9 +296,207 @@ private:
 
   std::vector<std::optional<K>> _keys =
       std::vector<std::optional<K>>(4, std::nullopt);
+};
 
-  std::vector<std::optional<V>> _vals =
-      std::vector<std::optional<V>>(4, std::nullopt);
+template <typename K, typename V>
+  requires(Hashable<K> && IsEqComparable<K>)
+struct Map {
+  /** @brief Inserts the value into the table with the given key. Requires that
+   * the key is not already present. */
+  constexpr void insert(K &&k, V &&v) {
+    maybe_rehash();
+    std::size_t idx = find_open(k);
+    _table[idx].emplace(std::move(k), std::move(v));
+  }
+
+  /** @brief Updates the key with the given value. Requires that the key is
+   * present in the table, throwing if not. */
+  constexpr void update(K const &k, V &&v) {
+    std::optional<std::size_t> idx = find(k);
+    if (!idx.has_value())
+      throw std::invalid_argument("Key not in table");
+    _table[idx].value().second = std::move(v);
+  }
+
+  /** @brief Either updates or inserts the value in the table according to
+   * whether the key was already present or not. Returns boolean indicating
+   * whether the key was inserted. */
+  template <typename U> constexpr bool insert_or_update(U &&u, V &&v) {
+    auto pos = find(u);
+    if (!pos.has_value()) {
+      std::size_t idx = pos.error();
+      if (maybe_rehash())
+        idx = find_open(u);
+
+      _table[idx].emplace(std::forward<U>(u), std::move(v));
+      return true;
+    } else {
+      std::size_t idx = pos.value();
+      _table[idx].value().second = std::move(v);
+      return false;
+    }
+    std::unreachable();
+  }
+
+  /** @brief Insert the value into the table only if the key is not already
+   * present. Does not touch the value if the key is present. Returns boolean
+   * indicating whether the value was added to the table. */
+  template <typename U, typename W> constexpr bool try_insert(U &&u, W &&w) {
+    auto pos = find(u);
+    if (!u.has_value()) {
+      std::size_t idx = u.error();
+
+      if (maybe_rehash())
+        idx = find_open(u);
+
+      _table[idx].emplace(std::forward<U>(u), std::forward<W>(w));
+      return true;
+    }
+    return false;
+  }
+
+  /** @brief Remove the entry for the given key, doing nothing if the key is not
+   * present. Returns a boolean indicating whether the key was removed from the
+   * table. */
+  constexpr bool remove(K const &k) noexcept {
+    auto pos = find(k);
+    if (pos.has_value()) {
+      std::size_t idx = pos.value();
+      _table[idx].reset();
+      _elements--;
+      _load_factor =
+          static_cast<double>(_elements) / static_cast<double>(_table.size());
+      return true;
+    }
+    return false;
+  }
+
+  /** @brief Remove all entries from the table. */
+  constexpr void clear() noexcept {
+    _elements = 0;
+    _load_factor = 0;
+    _table = std::vector<std::optional<K>>(_table.size(), std::nullopt);
+  }
+
+  /** @brief Return a reference to the value at the key, if the key is present
+   * in the table. */
+  constexpr std::optional<V &> at(K const &k) noexcept {
+    auto pos = find(k);
+    if (pos.has_value())
+      return _table[pos.value()].value().second;
+    else
+      return std::nullopt;
+  }
+
+  /** @brief Retrieve a reference to the value at the key, throwing if the key
+   * is not present in the table. */
+  constexpr V &at_throwing(K const &k) {
+    auto pos = find(k);
+    if (pos.has_value())
+      return _table[pos.value()].value().second;
+    else
+      throw std::invalid_argument("Key is not present in the table");
+  }
+
+  /** @brief Return whether the given key is present in the table. */
+  constexpr bool contains(K const &k) const noexcept {
+    return find(k).has_value();
+  }
+
+  /** @brief Return the number of elements present in the table. */
+  constexpr std::size_t size() const noexcept { return _elements; }
+
+  /** @brief Return the table's current load factor. */
+  constexpr double load_factor() const noexcept { return _load_factor; }
+
+  /** @brief Return whether the table is empty. */
+  constexpr bool empty() const noexcept { return _elements == 0; }
+
+  constexpr SkippingIterator<Pair<K, V>> begin() {
+    return {_table.begin(), _table.begin(), _table.end()};
+  }
+
+  constexpr SkippingIterator<Pair<K, V>> end() {
+    return {_table.end(), _table.begin(), _table.end()};
+  }
+
+private:
+  /** @brief Update the number of elements and load factor, rehashing the table
+   * if the load factor exceeds the configured threshold. Returns a boolean
+   * indicating whether the table was rehashed. */
+  constexpr bool maybe_rehash() {
+    _elements++;
+    _load_factor =
+        static_cast<double>(_elements) / static_cast<double>(_table.size());
+    if (_load_factor >= LOAD_FACTOR_THRESH) {
+      rehash();
+      return true;
+    } else
+      return false;
+  }
+
+  /** @brief Calculates the hash for the given key. */
+  constexpr std::size_t hash(K const &k) const {
+    return std::hash<K>{}(k) % _table.size();
+  }
+
+  /** @brief Finds the first open slot for the given key. */
+  constexpr std::size_t find_open(K const &k) const {
+    std::size_t h = hash(k);
+    std::size_t probe = 0;
+    while (_table[(h + probe) % _table.size()].has_value())
+      probe += PROBE_STEP;
+    return (h + probe) % _table.size();
+  }
+
+  /** @brief Resize and rehash the table. Invalidates all previous indices. */
+  constexpr void rehash() {
+    auto tmp_table = std::move(_table);
+
+    _table = std::vector<std::optional<Pair<K, V>>>(tmp_table.size() * 2,
+                                                    std::nullopt);
+
+    _load_factor /= 2.0;
+
+    for (auto &&e : std::move(tmp_table)) {
+      if (e.has_value()) {
+        std::size_t idx = find_open(e.value().first);
+        _table[idx] = std::move(e);
+      }
+    }
+  }
+
+  /** @brief Find the given key, or the first open slot at which it could be
+   * placed. Returns an expected which contains an index in both states. If the
+   * expected is in the error state, the index represents the place at which the
+   * key could be placed, otherwise it represents the index of that element in
+   * the table. */
+  constexpr std::expected<std::size_t, std::size_t> find(K const &k) const {
+    std::size_t h = hash(k);
+    std::size_t probe = 0;
+    std::size_t idx = (h + probe) % _table.size();
+    while (_table[idx].has_value()) {
+      if (_table[idx].value().first == k)
+        return idx;
+      else {
+        probe += PROBE_STEP;
+        idx = (h + probe) % _table.size();
+      }
+    }
+    return std::unexpected(idx);
+  }
+
+  /// @brief The step size used for linear probing
+  static constexpr std::size_t PROBE_STEP = 1;
+
+  /// @brief The load factor at or after which to rehash
+  static constexpr double LOAD_FACTOR_THRESH = 0.75;
+
+  std::size_t _elements = 0;
+  double _load_factor = 0;
+
+  std::vector<std::optional<Pair<K, V>>> _table =
+      std::vector<std::optional<Pair<K, V>>>(4, std::nullopt);
 };
 
 template <typename T>
@@ -319,5 +557,4 @@ public:
   }
 };
 */
-
 }; // namespace Reflexer::Methods
