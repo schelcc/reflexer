@@ -174,6 +174,14 @@ struct Set {
     return false;
   }
 
+  /** @brief Insert a range of values into the set, doing nothing for any values
+   * already present. */
+  constexpr void insert_range(std::ranges::input_range auto &&r) {
+    for (auto &&e : std::forward<decltype(r)>(r)) {
+      insert(std::forward<decltype(e)>(e));
+    }
+  }
+
   /** @brief Remove the key from the set if it is present. Returns boolean
    * indicating whether the key was present and is now removed. */
   constexpr bool remove(K &&k) {
